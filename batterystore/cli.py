@@ -8,6 +8,8 @@
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
+``group``    产线配组：录入实测、试算/执行自动配组、装簇、拆簇、拆串、拆下重配、
+             追溯单体履历、查看配组台账；
 ``reset``    清掉落盘的平台计数。
 """
 
@@ -165,6 +167,56 @@ def _cmd_alerts(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tolerance_args(args: argparse.Namespace) -> dict:
+    return {
+        "group_size": args.group_size,
+        "max_capacity_spread_pct": args.capacity_spread_pct,
+        "max_resistance_spread_pct": args.resistance_spread_pct,
+        "max_ocv_spread_pct": args.ocv_spread_pct,
+        "max_self_discharge_spread_pct": args.self_discharge_spread_pct,
+        "min_capacity_ah": args.min_capacity_ah,
+    }
+
+
+def _read_rows(args: argparse.Namespace) -> list[dict]:
+    if args.measurements_json:
+        with open(args.measurements_json, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        rows = payload.get("units", payload) if isinstance(payload, dict) else payload
+    else:
+        rows = json.loads(args.measurements)
+    if not isinstance(rows, list):
+        raise ValueError("--measurements 必须是实测行数组")
+    return rows
+
+
+def _cmd_group(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.action == "admit":
+        _dump(platform.admit_units(_read_rows(args)))
+    elif args.action == "preview":
+        _dump(platform.grouping_preview(args.policy, _tolerance_args(args)))
+    elif args.action == "run":
+        _dump(platform.group_units(args.policy, _tolerance_args(args)))
+    elif args.action == "mount":
+        _dump(platform.mount_group_rack(args.rack_id, args.group_ids))
+    elif args.action == "unmount":
+        _dump(platform.dismantle_group_rack(args.rack_id))
+    elif args.action == "dissolve":
+        _dump(platform.dismantle_group(args.group_id))
+    elif args.action == "reassign":
+        _dump(platform.reassign_grouping_unit(args.unit_id))
+    elif args.action == "trace":
+        _dump(platform.trace_grouping_unit(args.unit_id))
+    elif args.action == "pool":
+        _dump({"units": platform.grouping_pool()})
+    elif args.action == "list":
+        _dump({"groups": platform.grouping_groups(), "racks": platform.grouping_racks()})
+    else:
+        _dump(platform.grouping_snapshot())
+    return 0
+
+
 def _cmd_reset(args: argparse.Namespace) -> int:
     platform = _build(args)
     _dump(platform.reset_state())
@@ -209,6 +261,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     alerts = sub.add_parser("alerts", help="打印路由后的告警", parents=[common])
     alerts.set_defaults(func=_cmd_alerts)
+
+    group = sub.add_parser("group", help="产线自动配组与组串/簇登记", parents=[common])
+    group.add_argument(
+        "--action",
+        choices=("admit", "preview", "run", "mount", "unmount", "dissolve", "reassign", "trace", "pool", "list", "snapshot"),
+        default="snapshot",
+        help="配组动作，默认只看台账快照",
+    )
+    group.add_argument("--policy", choices=("hold_next_batch", "fill_suboptimal"), default="hold_next_batch",
+                       help="配不齐时：hold_next_batch 宁少一组等下批；fill_suboptimal 次优补位先凑组")
+    group.add_argument("--measurements", default="[]", help="实测行 JSON 数组")
+    group.add_argument("--measurements-json", help="从文件读实测行（数组或 {\"units\": [...]}）")
+    group.add_argument("--rack-id", help="装簇/拆簇用的簇标识")
+    group.add_argument("--group-id", help="拆串用的组串号")
+    group.add_argument("--unit-id", help="拆下重配/追溯用的单体号")
+    group.add_argument("--group-ids", nargs="*", default=[], help="装簇用的组串号列表")
+    group.add_argument("--group-size", type=int, default=13)
+    group.add_argument("--capacity-spread-pct", type=float, default=1.5)
+    group.add_argument("--resistance-spread-pct", type=float, default=5.0)
+    group.add_argument("--ocv-spread-pct", type=float, default=0.5)
+    group.add_argument("--self-discharge-spread-pct", type=float, default=20.0)
+    group.add_argument("--min-capacity-ah", type=float, default=100.0)
+    group.set_defaults(func=_cmd_group)
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)

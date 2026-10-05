@@ -66,6 +66,11 @@ class Api:
         add("GET", "/api/grid", lambda params, body: self._platform.grid_snapshot())
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
+        add("GET", "/api/grouping", lambda params, body: self._platform.grouping_snapshot())
+        add("GET", "/api/grouping/pool", lambda params, body: {"units": self._platform.grouping_pool()})
+        add("GET", "/api/grouping/groups", lambda params, body: {"groups": self._platform.grouping_groups()})
+        add("GET", "/api/grouping/racks", lambda params, body: {"racks": self._platform.grouping_racks()})
+        add("GET", "/api/grouping/unit/{unit_id}", self._grouping_trace)
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
@@ -100,6 +105,13 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/grouping/admit", self._grouping_admit)
+        add("POST", "/api/grouping/preview", self._grouping_preview)
+        add("POST", "/api/grouping/run", self._grouping_run)
+        add("POST", "/api/grouping/mount", self._grouping_mount)
+        add("POST", "/api/grouping/unmount", self._grouping_unmount)
+        add("POST", "/api/grouping/dissolve", self._grouping_dissolve)
+        add("POST", "/api/grouping/reassign", self._grouping_reassign)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +273,40 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _tolerance(self, body: dict) -> dict:
+        return {
+            "group_size": _as_int(body, "group_size", 13),
+            "max_capacity_spread_pct": _as_float(body, "max_capacity_spread_pct", 1.5),
+            "max_resistance_spread_pct": _as_float(body, "max_resistance_spread_pct", 5.0),
+            "max_ocv_spread_pct": _as_float(body, "max_ocv_spread_pct", 0.5),
+            "max_self_discharge_spread_pct": _as_float(body, "max_self_discharge_spread_pct", 20.0),
+            "min_capacity_ah": _as_float(body, "min_capacity_ah", 100.0),
+        }
+
+    def _grouping_admit(self, params: dict, body: dict) -> dict:
+        rows = body.get("units", body if isinstance(body, list) else [])
+        return self._platform.admit_units(rows)
+
+    def _grouping_preview(self, params: dict, body: dict) -> dict:
+        policy = str(body.get("policy", "hold_next_batch"))
+        return self._platform.grouping_preview(policy, self._tolerance(body))
+
+    def _grouping_run(self, params: dict, body: dict) -> dict:
+        policy = str(body.get("policy", "hold_next_batch"))
+        return self._platform.group_units(policy, self._tolerance(body))
+
+    def _grouping_mount(self, params: dict, body: dict) -> dict:
+        return self._platform.mount_group_rack(str(body["rack_id"]), list(body["group_ids"]))
+
+    def _grouping_unmount(self, params: dict, body: dict) -> dict:
+        return self._platform.dismantle_group_rack(str(body["rack_id"]))
+
+    def _grouping_dissolve(self, params: dict, body: dict) -> dict:
+        return self._platform.dismantle_group(str(body["group_id"]))
+
+    def _grouping_reassign(self, params: dict, body: dict) -> dict:
+        return self._platform.reassign_grouping_unit(str(body["unit_id"]))
+
+    def _grouping_trace(self, params: dict, body: dict) -> dict:
+        return self._platform.trace_grouping_unit(str(params.get("unit_id", "")))

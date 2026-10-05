@@ -24,6 +24,7 @@ packages = [
     "batterystore.grid",
     "batterystore.soc",
     "batterystore.balance",
+    "batterystore.grouping",
     "batterystore.quota",
     "batterystore.ops",
     "batterystore.console",

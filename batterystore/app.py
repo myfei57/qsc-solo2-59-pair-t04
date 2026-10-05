@@ -16,10 +16,12 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import InterlockError, StoreError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
+from .grouping import GroupingLedger, GroupTolerance, UnitMeasurement, default_tolerance
+from .grouping.policy import GapPolicy
 from .ids import IdFactory
 from .ns.capacity import CapacityPlan, plan_capacity
 from .ns.registry import NamespaceRegistry
@@ -90,6 +92,7 @@ class Platform:
         self.trend = TrendBuffer(period_s=5.0)
         self.ids = IdFactory("op")
         self.mapping = RackMapping()
+        self.grouping = GroupingLedger(store)
 
         self.racks: dict[str, Rack] = {}
         for index in range(max(1, rack_count)):
@@ -711,6 +714,154 @@ class Platform:
         """返回簇编号映射。"""
 
         return self.mapping.snapshot()
+
+    # ----- 产线配组 -------------------------------------------------------
+
+    @staticmethod
+    def _as_tolerance(spec: dict | GroupTolerance | None) -> GroupTolerance:
+        """把接口/CLI 传入的容差映射构造成判据，缺省走工艺默认窗口。"""
+
+        if isinstance(spec, GroupTolerance):
+            return spec
+        if not spec:
+            return default_tolerance()
+        return GroupTolerance(
+            group_size=int(spec.get("group_size", 13)),
+            max_capacity_spread_pct=float(spec.get("max_capacity_spread_pct", 1.5)),
+            max_resistance_spread_pct=float(spec.get("max_resistance_spread_pct", 5.0)),
+            max_ocv_spread_pct=float(spec.get("max_ocv_spread_pct", 0.5)),
+            max_self_discharge_spread_pct=float(spec.get("max_self_discharge_spread_pct", 20.0)),
+            min_capacity_ah=float(spec.get("min_capacity_ah", 100.0)),
+            max_resistance_mohm=spec.get("max_resistance_mohm", 0.8),
+            max_self_discharge_pct=spec.get("max_self_discharge_pct", 5.0),
+        )
+
+    @staticmethod
+    def _as_measurements(rows: list[dict]) -> list[UnitMeasurement]:
+        """把接口/CLI 的实测行构造成单体实测录入。"""
+
+        measurements: list[UnitMeasurement] = []
+        for row in rows:
+            unit_id = str(row.get("unit_id", ""))
+            if not unit_id:
+                raise InterlockError("单体实测缺少 unit_id", component="grouping")
+            measurements.append(
+                UnitMeasurement(
+                    unit_id=unit_id,
+                    capacity_ah=float(row["capacity_ah"]),
+                    resistance_mohm=float(row["resistance_mohm"]),
+                    ocv_v=float(row["ocv_v"]),
+                    self_discharge_pct=float(row["self_discharge_pct"]),
+                    batch_id=str(row.get("batch_id", "")),
+                    measured_ts=float(row.get("measured_ts", 0.0)),
+                )
+            )
+        return measurements
+
+    def _grouping_event(self, action: str, severity: str = "notice", **detail: object) -> None:
+        self.bus.publish(
+            Event.of("grouping", "grouping", action, station=self.station, severity=severity, **detail)
+        )
+
+    def admit_units(self, measurements: list[dict] | list[UnitMeasurement]) -> dict:
+        """把一批分选实测录入待配池。"""
+
+        with self._lock:
+            rows = [item for item in measurements]
+            admitted = [
+                item if isinstance(item, UnitMeasurement) else self._as_measurements([item])[0] for item in rows
+            ]
+            result = self.grouping.admit(admitted, ts=self.clock.now())
+            self._grouping_event("units_admitted", count=len(result["admitted"]))
+            return result
+
+    def grouping_preview(self, policy: str = "hold_next_batch", tolerance: dict | GroupTolerance | None = None) -> dict:
+        """试算配组与缺口，不落任何关系。"""
+
+        with self._lock:
+            return self.grouping.preview(self._as_tolerance(tolerance), GapPolicy.resolve(policy))
+
+    def group_units(self, policy: str = "hold_next_batch", tolerance: dict | GroupTolerance | None = None) -> dict:
+        """按多项实测自动配组并登记成组串，返回配组结果与缺口代价说明。"""
+
+        with self._lock:
+            result = self.grouping.auto_group(
+                self._as_tolerance(tolerance), GapPolicy.resolve(policy), ts=self.clock.now()
+            )
+            self._grouping_event(
+                "units_grouped",
+                severity="warning" if result["fill_groups"] else "notice",
+                conforming_groups=result["gap"]["conforming_groups"],
+                fill_groups=result["gap"]["fill_groups"],
+                waiting_count=result["gap"]["waiting_count"],
+                policy=policy,
+            )
+            return result
+
+    def mount_group_rack(self, rack_id: str, group_ids: list[str]) -> dict:
+        """把已配好的组串登记装成一个簇。"""
+
+        with self._lock:
+            result = self.grouping.mount_rack(rack_id, group_ids, ts=self.clock.now())
+            self._grouping_event("rack_mounted", rack_id=rack_id, groups=len(group_ids))
+            return result
+
+    def dismantle_group_rack(self, rack_id: str) -> dict:
+        """拆开一个组串簇，组串退回已绑定。"""
+
+        with self._lock:
+            result = self.grouping.dismantle_rack(rack_id, ts=self.clock.now())
+            self._grouping_event("rack_dismantled", rack_id=rack_id, groups=len(result["freed_group_ids"]))
+            return result
+
+    def dismantle_group(self, group_id: str) -> dict:
+        """整串拆下作废，单体全部回待配池重配。"""
+
+        with self._lock:
+            result = self.grouping.dismantle_group(group_id, ts=self.clock.now())
+            self._grouping_event("group_dismantled", group_id=group_id, units=len(result["returned_unit_ids"]))
+            return result
+
+    def reassign_grouping_unit(self, unit_id: str) -> dict:
+        """拆下一只单体重配，原串缺员作废、旧关系可追溯。"""
+
+        with self._lock:
+            result = self.grouping.reassign_unit(unit_id, ts=self.clock.now())
+            self._grouping_event(
+                "unit_reassigned", unit_id=unit_id, group_id=result["group_id"],
+                units=len(result["returned_unit_ids"]),
+            )
+            return result
+
+    def trace_grouping_unit(self, unit_id: str) -> dict:
+        """追溯一只单体的全部组串/簇履历。"""
+
+        with self._lock:
+            return self.grouping.trace_unit(unit_id)
+
+    def grouping_groups(self) -> list[dict]:
+        """返回当前有效组串登记。"""
+
+        with self._lock:
+            return self.grouping.groups()
+
+    def grouping_racks(self) -> list[dict]:
+        """返回当前装配中的组串簇登记。"""
+
+        with self._lock:
+            return self.grouping.racks()
+
+    def grouping_pool(self) -> list[dict]:
+        """返回待配池单体。"""
+
+        with self._lock:
+            return self.grouping.pool_units()
+
+    def grouping_snapshot(self) -> dict:
+        """返回配组台账快照。"""
+
+        with self._lock:
+            return self.grouping.snapshot()
 
     def bms_snapshot(self) -> dict:
         return self.bms.snapshot().as_dict()
