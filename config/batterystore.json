@@ -78,6 +78,12 @@
       "discharge_quota_kwh": 2000.0,
       "tariff_peak": 1.2,
       "tariff_valley": 0.4
+    },
+    "matching": {
+      "group_size": 12,
+      "capacity_spread_ah": 5.0,
+      "resistance_spread_mohm": 0.2,
+      "voltage_spread_mv": 20.0
     }
   }
 }

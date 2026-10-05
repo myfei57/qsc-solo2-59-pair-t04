@@ -4,7 +4,8 @@
 
 ``serve``    启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``     在本地跑一遍完整流程（启动 → 并网切换 → 温度降额 → 均衡 → 充电 →
-             放电 → 消防联动 → 复位 → 并发探测），用于交付前的真实运行检查；
+             放电 → 消防联动 → 复位 → 自动配组与拆下重配 → 并发探测），用于
+             交付前的真实运行检查；
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
@@ -20,11 +21,29 @@ import time
 
 from .app import Platform, build_platform
 from .clock import ManualClock, SystemClock
-from .config import config_to_mapping, default_config, load_config
+from .config import StationConfig, config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import StoreError
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/racks")
+
+
+def _demo_measurements(config: StationConfig) -> list[dict]:
+    """造一批带离散度的实测数据：大多数能成组，夹一只离群体现剔池留池。"""
+
+    size = config.matching.group_size
+    base = config.soc.capacity_ah
+    rows = [
+        {
+            "cell_id": f"demo-c{index + 1:02d}",
+            "capacity_ah": round(base + (index % 5) * 0.8, 3),
+            "resistance_mohm": round(0.18 + (index % 3) * 0.02, 3),
+            "voltage_v": round(3.29 + (index % 4) * 0.002, 4),
+        }
+        for index in range(size * 2 + 3)
+    ]
+    rows.append({"cell_id": "demo-cx1", "capacity_ah": base - 40.0, "resistance_mohm": 0.6, "voltage_v": 3.21})
+    return rows
 
 
 def _build(args: argparse.Namespace) -> Platform:
@@ -92,6 +111,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     drill = platform.fire_drill(zone="Z1", smoke_ppm=1500.0, temperature_c=30.0, confirm_dt=5.0)
     release = platform.release_fire()
     calibration = platform.calibrate_soc(68.0, "demo")
+    matching = platform.plan_matching(_demo_measurements(config), requested_groups=3)
+    first_cell = matching["registered"][0]["cells"][0]
+    detached = platform.detach_cell(first_cell, "demo_repair")
+    lineage = platform.cell_grouping(first_cell)
     probe = platform.concurrency_probe(rounds=args.rounds)
     fault_probe = platform.concurrency_fault_probe(rounds=8)
     alarms = platform.alerts()
@@ -115,6 +138,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "fire_drill": {"ok": drill["ok"], "steps": [step["action"] for step in drill["steps"]]},
         "fire_release": release,
         "calibration": calibration,
+        "matching": {
+            "formed_groups": matching["plan"]["formed_groups"],
+            "shortfall": matching["plan"]["shortfall"],
+            "policy_note": matching["plan"]["policy_note"],
+            "detached": detached,
+            "lineage_records": len(lineage["history"]),
+        },
         "concurrency": probe,
         "concurrency_fault": fault_probe,
         "alerts": alarms,

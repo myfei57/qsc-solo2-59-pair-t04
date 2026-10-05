@@ -67,6 +67,8 @@ class Api:
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
+        add("GET", "/api/matching", lambda params, body: self._platform.matching_snapshot())
+        add("GET", "/api/matching/cell/{cell_id}", lambda params, body: self._platform.cell_grouping(str(params.get("cell_id", ""))))
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
@@ -100,6 +102,8 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/matching/plan", self._matching_plan)
+        add("POST", "/api/matching/detach", self._matching_detach)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +265,20 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _matching_plan(self, params: dict, body: dict) -> dict:
+        raw = body.get("measurements")
+        if not isinstance(raw, list) or not raw:
+            raise StoreError("measurements 必须是非空列表", component="console")
+        requested = body.get("requested_groups")
+        try:
+            requested_groups = int(requested) if requested is not None else None
+        except (TypeError, ValueError) as error:
+            raise StoreError("参数 'requested_groups' 必须是整数", component="console") from error
+        return self._platform.plan_matching(raw, rack_id=body.get("rack_id"), requested_groups=requested_groups)
+
+    def _matching_detach(self, params: dict, body: dict) -> dict:
+        cell_id = body.get("cell_id")
+        if not cell_id:
+            raise StoreError("缺少 cell_id", component="console")
+        return self._platform.detach_cell(str(cell_id), reason=str(body.get("reason", "manual")))

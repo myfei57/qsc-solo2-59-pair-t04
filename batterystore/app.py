@@ -1,9 +1,10 @@
 """平台装配与控制循环。
 
-``Platform`` 把各组件按真实联控链接起来，并暴露五类动作：并离网切换、充放电、
-均衡、温度采集与消防联动。控制循环每个周期做六件事：采集温度并刷新降额基线、
-核对保护判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块
-动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
+``Platform`` 把各组件按真实联控链接起来，并暴露六类动作：并离网切换、充放电、
+均衡、温度采集、消防联动与自动配组。控制循环每个周期做六件事：采集温度并刷新
+降额基线、核对保护判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数
+落盘。跨模块动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计；配组
+按 :mod:`batterystore.matching` 的规划结果登记到组串与簇，组套沿革全程可查。
 """
 
 from __future__ import annotations
@@ -16,11 +17,12 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import NamespaceError, StoreError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
 from .ids import IdFactory
+from .matching import CellMeasurement, GroupRegistry, plan_groups
 from .ns.capacity import CapacityPlan, plan_capacity
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
@@ -90,6 +92,8 @@ class Platform:
         self.trend = TrendBuffer(period_s=5.0)
         self.ids = IdFactory("op")
         self.mapping = RackMapping()
+        self.matching = GroupRegistry()
+        self.group_ids = IdFactory("grp")
 
         self.racks: dict[str, Rack] = {}
         for index in range(max(1, rack_count)):
@@ -130,6 +134,7 @@ class Platform:
             ("station", "soc", "state-of-charge"),
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
+            ("station", "matching", "cell-matching"),
             ("station", "audit", "run-audit"),
         ):
             self.namespaces.register(area, device, kind)
@@ -553,6 +558,95 @@ class Platform:
                 "delta_mv": round(metrics.delta_mv, 2),
             }
 
+    def plan_matching(
+        self,
+        measurements: list,
+        rack_id: str | None = None,
+        requested_groups: int | None = None,
+    ) -> dict:
+        """按多项实测自动配组：规划 → 登记到组串与簇 → 审计留痕。
+
+        缺口按"宁可少配一组等下一批"处理：留池单体不登记，随下一批重测重配，
+        欠账组数与代价写在返回报告的 ``plan.policy_note`` 里。在册单体不能直接
+        参与新一批配组，必须先从原组拆下，从流程上杜绝一只单体同时挂两组。
+        """
+
+        with self._lock:
+            op_id = self.ids.next()
+            rack = self._rack(rack_id)
+            parsed = [
+                item if isinstance(item, CellMeasurement) else CellMeasurement.from_mapping(item)
+                for item in measurements
+            ]
+            assigned = self.matching.snapshot()["cells"]
+            clash = [item.cell_id for item in parsed if item.cell_id in assigned]
+            if clash:
+                raise NamespaceError(f"单体已在册，须先拆下再重配: {clash}", component="matching")
+            plan = plan_groups(parsed, self.config.matching, requested_groups=requested_groups)
+            on_rack = [
+                group
+                for group in self.matching.snapshot()["groups"].values()
+                if group["rack_id"] == rack.rack_id
+            ]
+            pack_index = len(on_rack) + 1
+            registered: list[dict] = []
+            steps: list[dict] = [
+                {
+                    "component": "matching",
+                    "action": "plan",
+                    "detail": {
+                        "cells": len(parsed),
+                        "formed": len(plan.groups),
+                        "deferred": len(plan.deferred),
+                        "shortfall": plan.shortfall,
+                    },
+                }
+            ]
+            for planned in plan.groups:
+                group_id = self.group_ids.next()
+                pack_id = f"{rack.rack_id}-mg{pack_index}"
+                change = self.matching.register(
+                    group_id, pack_id, rack.rack_id, [item.cell_id for item in planned.cells]
+                )
+                registered.append(change)
+                steps.append(
+                    {
+                        "component": "matching",
+                        "action": "register",
+                        "detail": {"group_id": group_id, "pack_id": pack_id, "cells": len(planned.cells)},
+                    }
+                )
+                pack_index += 1
+            report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
+            summary = self._record_operation(op_id, "matching", report)
+            return {**report, "rack_id": rack.rack_id, "plan": plan.as_dict(), "registered": registered, **summary}
+
+    def detach_cell(self, cell_id: str, reason: str = "manual") -> dict:
+        """把单体从当前组拆下：解除在册关系，原组套关系留历史可追溯。"""
+
+        with self._lock:
+            change = self.matching.detach(cell_id, reason)
+            detail = {
+                key: value
+                for key, value in change.items()
+                if key not in ("topic", "component", "action") and not isinstance(value, (dict, list))
+            }
+            self.bus.publish(
+                Event.of("matching", "matching", "cell_detached", station=self.station, severity="notice", **detail)
+            )
+            return change
+
+    def cell_grouping(self, cell_id: str) -> dict:
+        """返回单体的当前组套与全部沿革，用于拆下重配后的双向追溯。"""
+
+        with self._lock:
+            try:
+                current = self.matching.group_of(cell_id)
+                current["members"] = self.matching.members(current["group_id"])
+            except NamespaceError:
+                current = None
+            return {"cell_id": cell_id, "current": current, "history": self.matching.history_of(cell_id)}
+
     def cycle(self, dt: float = 5.0) -> dict:
         """推进一个控制周期。"""
 
@@ -734,6 +828,9 @@ class Platform:
     def balance_snapshot(self) -> dict:
         return self.balancer.snapshot().as_dict()
 
+    def matching_snapshot(self) -> dict:
+        return self.matching.snapshot()
+
     def quota_snapshot(self) -> dict:
         return self.quota.snapshot(self.clock.now()).as_dict()
 
@@ -767,6 +864,7 @@ class Platform:
             "grid": self.grid_snapshot(),
             "soc": self.soc_snapshot(),
             "balance": self.balance_snapshot(),
+            "matching": self.matching_snapshot(),
         }
 
     def snapshot(self) -> dict:
@@ -804,5 +902,6 @@ def build_platform(
             soc=resolved.soc,
             balance=resolved.balance,
             quota=resolved.quota,
+            matching=resolved.matching,
         )
     return Platform(config=resolved, clock=clock, rack_count=rack_count)
